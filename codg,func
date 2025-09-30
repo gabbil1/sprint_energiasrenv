@@ -1,0 +1,293 @@
+
+"""
+GoodWe Renewable + Automation Prototype (Simulated)
+---------------------------------------------------
+Simulates PV generation, GoodWe inverter, battery storage, home/SMB load,
+and simple automation rules (smart load + voice command placeholder).
+
+How to run:
+    python prototype_goodwe_sim.py
+
+Outputs:
+    goodwe_sim_results.csv
+    plot_pv_load.png
+    plot_battery.png
+    plot_grid.png
+    plot_automation.png
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
+import math
+import os
+
+# ---------------------
+# 1) Parameters
+# ---------------------
+SIM_HOURS = 48
+DT_MIN = 5  # minutes
+N = int((SIM_HOURS * 60) / DT_MIN)
+
+# "Plant" sizing
+PV_KWP = 5.0            # PV nameplate (kWp)
+INV_AC_KW = 4.6         # Inverter AC limit (kW) - typical GoodWe size for 5kWp
+INV_EFF_MAX = 0.975     # Peak inverter efficiency (simplified)
+BATT_CAP_KWH = 10.0     # Battery capacity (kWh)
+BATT_SOC_MIN = 0.1      # 10%
+BATT_SOC_MAX = 0.95     # 95% usable ceiling
+BATT_C_RATE = 0.5       # 0.5C -> max charge/discharge ~ 5 kW for 10 kWh (limit to invert.)
+BATT_ROUNDTRIP_EFF = 0.92
+BATT_CHG_EFF = math.sqrt(BATT_ROUNDTRIP_EFF)
+BATT_DIS_EFF = math.sqrt(BATT_ROUNDTRIP_EFF)
+
+# Load profile
+BASE_LOAD_KW = 0.35
+EVENING_PEAK_KW = 2.2
+MORNING_PEAK_KW = 1.2
+
+# Smart load: e.g., water heater/boiler 1.2 kW
+SMART_LOAD_KW = 1.2
+SMART_ENABLE_SOC = 0.8       # turn ON if SOC > 80% and PV surplus
+SMART_DISABLE_SOC = 0.6      # turn OFF if SOC < 60% or no surplus
+
+# Time-of-use price (simulated): higher 18:00-22:00
+PRICE_LOW = 0.5   # R$/kWh
+PRICE_HIGH = 1.2  # R$/kWh
+
+# Voice command placeholder (simulate a toggle event around t=24h)
+VOICE_COMMAND_TIME_MIN = 24 * 60  # minute index where a command arrives
+VOICE_FORCE_SMART_ON_MINUTES = 60 # force smart load ON for 60 minutes
+
+# Random seed for reproducibility
+np.random.seed(42)
+
+# ---------------------
+# 2) Helper functions
+# ---------------------
+def solar_irradiance_profile(minute_idx):
+    """Daily sinusoid with clouds noise, repeating every 24h."""
+    minutes_in_day = 24 * 60
+    m = minute_idx % minutes_in_day
+
+    # sunrise ~06:30 (390), sunset ~18:30 (1110)
+    sunrise = 390
+    sunset = 1110
+    if m < sunrise or m > sunset:
+        return 0.0
+    # scale 0..1 bell from sunrise to sunset
+    x = (m - sunrise) / (sunset - sunrise) * math.pi
+    base = max(0.0, math.sin(x))
+    # add cloudiness noise blocky (every 30 min window)
+    cloud = 1.0 - 0.15 * np.random.randn()
+    cloud = np.clip(cloud, 0.6, 1.1)
+    return max(0.0, base * cloud)
+
+def pv_ac_power_kw(irr_norm):
+    """PV DC power = PV_KWP * irr_norm. Inverter clips at INV_AC_KW and applies eff curve."""
+    dc_kw = PV_KWP * irr_norm
+    if dc_kw <= 0.05:  # below wake threshold
+        return 0.0
+    # simple inverter efficiency: rises with load, capped by INV_AC_KW
+    load_frac = min(dc_kw / INV_AC_KW, 1.0)
+    eff = INV_EFF_MAX * (0.85 + 0.15 * load_frac)  # slightly lower at very low load
+    ac_kw = min(dc_kw * eff, INV_AC_KW)
+    return max(0.0, ac_kw)
+
+def load_profile_kw(minute_idx):
+    """Base + morning and evening peaks with randomness."""
+    minutes_in_day = 24 * 60
+    m = minute_idx % minutes_in_day
+
+    noise = np.random.normal(0, 0.05)
+    load = BASE_LOAD_KW + noise
+    # morning 07:00-09:00
+    if 420 <= m <= 540:
+        load += MORNING_PEAK_KW * 0.6 * math.sin((m-420)/120*math.pi)
+    # evening 18:00-22:00
+    if 1080 <= m <= 1320:
+        load += EVENING_PEAK_KW * 0.7 * math.sin((m-1080)/240*math.pi)
+    return max(0.05, load)
+
+def tou_price_r_per_kwh(minute_idx):
+    m = minute_idx % (24*60)
+    if 1080 <= m < 1320:  # 18:00-22:00
+        return PRICE_HIGH
+    return PRICE_LOW
+
+# ---------------------
+# 3) Simulation loop
+# ---------------------
+start = datetime.now().replace(hour=8, minute=0, second=0, microsecond=0)
+ts = [start + timedelta(minutes=i*DT_MIN) for i in range(N)]
+
+soc_kwh = BATT_CAP_KWH * 0.5  # start at 50%
+soc_hist = []
+pv_hist = []
+load_hist = []
+smart_on_hist = []
+grid_import_hist = []
+grid_export_hist = []
+batt_p_hist = []
+price_hist = []
+voice_flag_hist = []
+
+smart_on = False
+voice_force_until = None
+
+for i, t in enumerate(ts):
+    irr = solar_irradiance_profile(i*DT_MIN)
+    pv_kw = pv_ac_power_kw(irr)
+    base_load_kw = load_profile_kw(i*DT_MIN)
+
+    # voice command window
+    voice_active = False
+    if i * DT_MIN == VOICE_COMMAND_TIME_MIN:
+        voice_force_until = t + timedelta(minutes=VOICE_FORCE_SMART_ON_MINUTES)
+    if voice_force_until is not None and t <= voice_force_until:
+        voice_active = True
+        smart_on = True
+
+    price = tou_price_r_per_kwh(i*DT_MIN)
+
+    # Smart load automation when no voice override
+    if not voice_active:
+        surplus_pred = pv_kw - base_load_kw
+        if smart_on:
+            # turn off if SOC too low or no surplus
+            if (soc_kwh / BATT_CAP_KWH) < SMART_DISABLE_SOC or surplus_pred < 0.0:
+                smart_on = False
+        else:
+            # turn on if SOC high and surplus available
+            if (soc_kwh / BATT_CAP_KWH) > SMART_ENABLE_SOC and surplus_pred > 0.2:
+                smart_on = True
+
+    total_load_kw = base_load_kw + (SMART_LOAD_KW if smart_on else 0.0)
+
+    # Power balance: PV -> load; remainder to battery or grid
+    net_kw = pv_kw - total_load_kw
+
+    # Battery limits (kW)
+    batt_max_kw = BATT_CAP_KWH * BATT_C_RATE
+    batt_max_kw = min(batt_max_kw, INV_AC_KW)  # inverter limit gate
+
+    batt_p_kw = 0.0  # +charge, -discharge
+
+    dt_h = DT_MIN / 60.0
+
+    if net_kw > 0:
+        # charge battery with surplus
+        charge_kw = min(net_kw, batt_max_kw)
+        possible_kwh = charge_kw * dt_h * BATT_CHG_EFF
+        room_kwh = BATT_CAP_KWH * BATT_SOC_MAX - soc_kwh
+        if possible_kwh > room_kwh:
+            # limit charge
+            charge_kw = room_kwh / (dt_h * BATT_CHG_EFF) if dt_h > 0 else 0.0
+        batt_p_kw = max(0.0, charge_kw)
+        # update SOC
+        soc_kwh += batt_p_kw * dt_h * BATT_CHG_EFF
+        # grid export if still surplus
+        grid_export = max(0.0, net_kw - batt_p_kw)
+        grid_import = 0.0
+    else:
+        # need energy: discharge battery first (esp. when price high)
+        demand_kw = min(-net_kw, batt_max_kw)
+        available_kwh = soc_kwh - BATT_CAP_KWH * BATT_SOC_MIN
+        max_discharge_kw = available_kwh / (dt_h * BATT_DIS_EFF) if dt_h > 0 else 0.0
+        discharge_kw = max(0.0, min(demand_kw, max_discharge_kw))
+
+        batt_p_kw = -discharge_kw
+        # update SOC
+        soc_kwh -= discharge_kw * dt_h * BATT_DIS_EFF
+
+        # remaining demand from grid
+        remaining_kw = -net_kw - discharge_kw
+        grid_import = max(0.0, remaining_kw)
+        grid_export = 0.0
+
+    # Log
+    soc_hist.append(soc_kwh / BATT_CAP_KWH)
+    pv_hist.append(pv_kw)
+    load_hist.append(total_load_kw)
+    smart_on_hist.append(1 if smart_on else 0)
+    grid_import_hist.append(grid_import)
+    grid_export_hist.append(grid_export)
+    batt_p_hist.append(batt_p_kw)
+    price_hist.append(price)
+    voice_flag_hist.append(1 if voice_active else 0)
+
+# ---------------------
+# 4) Save CSV
+# ---------------------
+df = pd.DataFrame({
+    "timestamp": ts,
+    "pv_kw": pv_hist,
+    "load_kw": load_hist,
+    "battery_soc": soc_hist,
+    "battery_power_kw": batt_p_hist,   # +charge / -discharge
+    "grid_import_kw": grid_import_hist,
+    "grid_export_kw": grid_export_hist,
+    "smart_load_on": smart_on_hist,
+    "price_r_per_kwh": price_hist,
+    "voice_override": voice_flag_hist,
+})
+df.to_csv("goodwe_sim_results.csv", index=False)
+
+# ---------------------
+# 5) Plots (one chart per figure, no custom colors/styles)
+# ---------------------
+# PV & Load
+plt.figure()
+plt.plot(df["timestamp"], df["pv_kw"], label="PV (kW)")
+plt.plot(df["timestamp"], df["load_kw"], label="Load (kW)")
+plt.legend()
+plt.title("PV Generation and Load")
+plt.xlabel("Time")
+plt.ylabel("kW")
+plt.xticks(rotation=15)
+plt.tight_layout()
+plt.savefig("plot_pv_load.png")
+plt.close()
+
+# Battery SOC and Power
+plt.figure()
+plt.plot(df["timestamp"], df["battery_soc"], label="Battery SOC (0..1)")
+plt.legend()
+plt.title("Battery State of Charge")
+plt.xlabel("Time")
+plt.ylabel("SOC")
+plt.xticks(rotation=15)
+plt.tight_layout()
+plt.savefig("plot_battery.png")
+plt.close()
+
+# Grid flows
+plt.figure()
+plt.plot(df["timestamp"], df["grid_import_kw"], label="Grid Import (kW)")
+plt.plot(df["timestamp"], df["grid_export_kw"], label="Grid Export (kW)")
+plt.legend()
+plt.title("Grid Import/Export")
+plt.xlabel("Time")
+plt.ylabel("kW")
+plt.xticks(rotation=15)
+plt.tight_layout()
+plt.savefig("plot_grid.png")
+plt.close()
+
+# Automation markers
+plt.figure()
+plt.plot(df["timestamp"], df["smart_load_on"], label="Smart Load (0/1)")
+plt.plot(df["timestamp"], df["voice_override"], label="Voice Override (0/1)")
+plt.legend()
+plt.title("Automation States")
+plt.xlabel("Time")
+plt.ylabel("State")
+plt.xticks(rotation=15)
+plt.tight_layout()
+plt.savefig("plot_automation.png")
+plt.close()
+
+print("Simulation complete. Files saved:")
+for f in ["goodwe_sim_results.csv","plot_pv_load.png","plot_battery.png","plot_grid.png","plot_automation.png"]:
+    print(" -", f)
