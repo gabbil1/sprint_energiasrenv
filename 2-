@@ -1,0 +1,60 @@
+# Sistema Integrado com Inversor GoodWe (Protótipo Simulado em Python)
+
+Este protótipo demonstra a integração entre **geração fotovoltaica**, **inversor GoodWe (simulado)**, **bateria**, **cargas**, **automação (smart load)** e um **gancho de comando por voz** (simulado por tempo).
+
+## Como executar
+1. Instale Python 3.10+.
+2. Instale as dependências (apenas bibliotecas da stdlib + `matplotlib`, `pandas`, `numpy`):
+   ```bash
+   pip install matplotlib pandas numpy
+   ```
+3. Rode o simulador:
+   ```bash
+   python prototype_goodwe_sim.py
+   ```
+
+## Saídas geradas
+- `goodwe_sim_results.csv` — série temporal com: PV, carga, SOC da bateria, potência da bateria, importação/exportação da rede, preço TOU, flags de automação.
+- `plot_pv_load.png` — geração PV vs. carga.
+- `plot_battery.png` — estado de carga (SOC) da bateria.
+- `plot_grid.png` — importação/exportação da rede.
+- `plot_automation.png` — estados ON/OFF da carga inteligente e override por voz.
+
+## Lógica de Integração (Resumo Técnico)
+- **PV → Inversor GoodWe (simulado)**: potência AC limitada a 4.6 kW com eficiência máxima ~97,5%.
+- **Bateria (10 kWh)**: limites de carga/descarga por taxa C e inverter ceiling; eficiência de ida/volta ~92%.
+- **Cargas**: perfil base + picos manhã/noite; **carga inteligente** (ex.: boiler 1,2 kW) liga quando há **excedente PV** e **SOC > 80%**; desliga se **SOC < 60%** ou faltar excedente.
+- **Preço por horário (TOU)**: preço alto 18:00–22:00 para justificar uso da bateria no pico.
+- **Comando por voz (placeholder)**: força a carga inteligente ligada por 60 min no marco de 24h, simulando integração com assistente virtual.
+
+## Diagrama de Blocos (texto)
+```
+[ Painel FV ] -> (DC) -> [ Inversor GoodWe (sim) ] -> (AC) -> [ Cargas ]
+                                         |-> [ Bateria ] <-> [ Automação (regras) ]
+                                         |-> [ Medições / CSV / Gráficos ]
+                                         |-> [ Gatilho de Voz (simulado) ]
+```
+
+## Justificativa das Escolhas
+- **GoodWe/inversor** como núcleo da conversão CC→CA, refletindo o mercado real de prosumers.
+- **Bateria** para flexibilidade operacional e redução do pico tarifário.
+- **Automação** para priorizar autoconsumo e usar excedentes de forma inteligente.
+- **TOU** para evidenciar benefício econômico e decisão de descarga em horários caros.
+- **Simulação Python** por ser reprodutível, leve e permitir visualizações rápidas.
+
+## Roteiro para Vídeo (até 5 minutos)
+1. **(0:00–0:20) Abertura** — Título do projeto, equipe, objetivo.
+2. **(0:20–1:00) Arquitetura** — Mostre este diagrama e explique os blocos.
+3. **(1:00–2:30) Demonstração** — Abra os gráficos PNG e destaque:
+   - PV vs. Load (vales/noturnos, picos diurnos).
+   - SOC subindo com sol, caindo no pico tarifário à noite.
+   - Import/Export variando conforme excedente.
+   - Smart Load ligando com SOC alto e excedente; override de voz no meio da simulação.
+4. **(2:30–3:30) Métricas** — Mostre o CSV rápido (poucas linhas) e comente ganhos previstos (menor importação no pico).
+5. **(3:30–4:20) Integração** — Reforce a lógica de decisões e como seria no hardware real (medidores, relés, API GoodWe).
+6. **(4:20–5:00) Conclusão** — Benefícios ambientais, econômicos e próximos passos (API real, IA de previsão solar, controle por demanda).
+
+## Próximos Passos (opcionais para Sprint 4)
+- Conectar a APIs reais (ex.: GoodWe SEMS/DTUs) para ler produção em tempo real.
+- Integrar relés/contatores via ESP32 para controle físico.
+- Adicionar previsão de irradiância/tempo e otimização (regra baseada em preço/tempo).
